@@ -1,3 +1,4 @@
+from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -44,7 +45,7 @@ class DiagnoseRequest(BaseModel):
 class DiagnoseResponse(BaseModel):
     reply: str
     is_result: bool
-    result: dict | None = None
+    result: Optional[dict] = None
 
 
 @app.get("/health")
