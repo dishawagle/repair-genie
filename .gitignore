@@ -1,0 +1,40 @@
+# ── Secrets & environment variables ───────────────────────────────────────
+# These files contain API keys and must NEVER be committed
+.env
+.env.*
+!.env.example        # Allow the example template
+backend/.env
+backend/.env.*
+!backend/.env.example
+
+# Streamlit secrets
+**/secrets.toml
+frontend/.streamlit/secrets.toml
+
+# ── Python ─────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# ── OS ─────────────────────────────────────────────────────────────────────
+.DS_Store
+Thumbs.db
+
+# ── IDEs ───────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# ── Build / dist ───────────────────────────────────────────────────────────
+dist/
+build/
+*.egg-info/
