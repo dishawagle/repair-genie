@@ -1,7 +1,7 @@
-from typing import Optional
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
+from typing import Optional
 import google.generativeai as genai
 import json
 import os
@@ -15,22 +15,32 @@ app = FastAPI(title="Repair Genie API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Tighten this in production
+    allow_origins=["*"],
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-SYSTEM_PROMPT = """You are Repair Genie, a warm and expert appliance repair AI. Diagnose home appliance problems.
+SYSTEM_PROMPT = """You are Repair Genie, an expert appliance repair AI. Diagnose home appliance problems.
 
-RULES:
-- If you need more info to reach 90% confidence, ask ONE concise follow-up question at a time.
-- Only output the final REPAIR_RESULT when you are at least 90% confident about root causes.
-- When confident, output EXACTLY this block (nothing after it):
+CONVERSATION FLOW:
+- Ask at most 2 follow-up questions to clarify the issue. Ask ONE at a time.
+- After at most 2 rounds of follow-up, you MUST output REPAIR_RESULT.
+- Never keep asking questions without eventually producing a diagnosis.
+
+CRITICAL OUTPUT RULE:
+When ready to diagnose, output REPAIR_RESULT IMMEDIATELY with absolutely NO preamble, NO intro sentence, NO "Here is my diagnosis", NO "Based on what you told me" — nothing before it. Jump straight to REPAIR_RESULT. The JSON must be on a single line.
 
 REPAIR_RESULT:
-{"causes":[{"label":"Root cause description","probability":72},{"label":"Another cause","probability":18}],"safety":["Safety check 1","Safety check 2"],"steps":["Step 1: do this","Step 2: then this","Step 3: continue"]}
+{"causes":[{"label":"Root cause","probability":72},{"label":"Another cause","probability":20}],"safety":["Safety check 1","Safety check 2"],"diy_possible":true,"diy_steps":["Step 1","Step 2","Step 3"],"diy_note":"","needs_contractor":false,"contractor_reason":""}
 
-Probabilities must sum to ≤100. Include 1-4 causes, 2-4 safety items, 3-8 steps. Be warm, clear, and practical."""
+JSON RULES:
+- causes: 1-4 items, probabilities sum to ≤100
+- safety: 2-5 checks the user MUST do before touching anything
+- diy_steps: 3-8 clear steps written for a non-technical homeowner
+- diy_possible: set false if fix involves gas lines, internal wiring, or sealed refrigerant; explain in diy_note
+- needs_contractor: set true if a professional is required; explain in contractor_reason
+- All fields must be present, use empty string "" if not applicable
+- Do NOT wrap JSON in markdown code fences"""
 
 
 class Message(BaseModel):
@@ -48,6 +58,76 @@ class DiagnoseResponse(BaseModel):
     result: Optional[dict] = None
 
 
+import re as _re
+
+def strip_html(text: str) -> str:
+    """Remove any HTML tags Gemini may have accidentally included."""
+    return _re.sub(r'<[^>]+>', '', text).strip()
+
+def clean_result(result: dict) -> dict:
+    """Strip HTML tags from all string fields in the result."""
+    for item in result.get("causes", []):
+        if isinstance(item.get("label"), str):
+            item["label"] = strip_html(item["label"])
+    for key in ("safety", "diy_steps"):
+        result[key] = [strip_html(s) for s in result.get(key, [])]
+    for key in ("diy_note", "contractor_reason"):
+        if isinstance(result.get(key), str):
+            result[key] = strip_html(result[key])
+    return result
+
+
+def extract_json_object(text: str) -> Optional[dict]:
+    """Extract the first complete JSON object from a string."""
+    start = text.find("{")
+    if start == -1:
+        return None
+    brace_count, end_idx = 0, 0
+    for i, ch in enumerate(text[start:], start):
+        if ch == "{": brace_count += 1
+        elif ch == "}": brace_count -= 1
+        if brace_count == 0 and i > start:
+            end_idx = i + 1
+            break
+    if not end_idx:
+        return None
+    try:
+        return json.loads(text[start:end_idx])
+    except json.JSONDecodeError:
+        return None
+
+
+def try_parse_result(reply: str) -> Optional[dict]:
+    """
+    Try multiple strategies to extract a REPAIR_RESULT JSON from Gemini's reply.
+    Handles: REPAIR_RESULT: prefix, raw JSON, ```json fences, mixed preamble text.
+    """
+    required_keys = {"causes", "safety", "diy_steps", "diy_possible", "needs_contractor"}
+
+    # Strategy 1: Look for REPAIR_RESULT: marker
+    if "REPAIR_RESULT:" in reply:
+        after = reply.split("REPAIR_RESULT:")[1].strip()
+        after = after.strip("` \n")
+        if after.startswith("json"):
+            after = after[4:].strip()
+        result = extract_json_object(after)
+        if result and required_keys.issubset(result.keys()):
+            return clean_result(result)
+
+    # Strategy 2: Find any JSON object in the reply that has the required keys
+    result = extract_json_object(reply)
+    if result and required_keys.issubset(result.keys()):
+        return clean_result(result)
+
+    # Strategy 3: Strip markdown fences and try again
+    clean = reply.replace("```json", "").replace("```", "").strip()
+    result = extract_json_object(clean)
+    if result and required_keys.issubset(result.keys()):
+        return clean_result(result)
+
+    return None
+
+
 @app.get("/health")
 def health():
     return {"status": "ok"}
@@ -60,12 +140,12 @@ async def diagnose(req: DiagnoseRequest):
 
     try:
         model = genai.GenerativeModel(
-            model_name="gemini-1.5-flash",
+            model_name="gemini-2.5-flash",
             system_instruction=SYSTEM_PROMPT,
+            generation_config=genai.GenerationConfig(max_output_tokens=8192),
         )
 
-        # Convert messages to Gemini format
-        # Gemini uses "user" and "model" roles (not "assistant")
+        # Convert messages to Gemini format (Gemini uses "model" not "assistant")
         history = []
         for m in req.messages[:-1]:
             history.append({
@@ -77,14 +157,10 @@ async def diagnose(req: DiagnoseRequest):
         response = chat.send_message(req.messages[-1].content)
         reply = response.text
 
-        # Check if it's a final diagnosis
-        if "REPAIR_RESULT:" in reply:
-            try:
-                json_str = reply.split("REPAIR_RESULT:")[1].strip()
-                result = json.loads(json_str)
-                return DiagnoseResponse(reply=reply, is_result=True, result=result)
-            except json.JSONDecodeError:
-                pass
+        # Try to parse REPAIR_RESULT — handles multiple formats Gemini might output
+        result = try_parse_result(reply)
+        if result:
+            return DiagnoseResponse(reply=reply, is_result=True, result=result)
 
         return DiagnoseResponse(reply=reply, is_result=False)
 
