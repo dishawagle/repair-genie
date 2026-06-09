@@ -1,2 +1,5 @@
 streamlit==1.35.0
 requests==2.32.3
+qrcode[pil]==7.4.2
+pillow==10.3.0
+filelock==3.13.1
